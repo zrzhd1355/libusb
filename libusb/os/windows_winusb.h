@@ -58,23 +58,6 @@
 // Additional return code for HID operations that completed synchronously
 #define LIBUSB_COMPLETED	(LIBUSB_SUCCESS + 1)
 
-// http://msdn.microsoft.com/en-us/library/ff545978.aspx
-// http://msdn.microsoft.com/en-us/library/ff545972.aspx
-// http://msdn.microsoft.com/en-us/library/ff545982.aspx
-#ifndef GUID_DEVINTERFACE_USB_HOST_CONTROLLER
-const GUID GUID_DEVINTERFACE_USB_HOST_CONTROLLER = { 0x3ABF6F2D, 0x71C4, 0x462A, {0x8A, 0x92, 0x1E, 0x68, 0x61, 0xE6, 0xAF, 0x27} };
-#endif
-#ifndef GUID_DEVINTERFACE_USB_DEVICE
-const GUID GUID_DEVINTERFACE_USB_DEVICE = { 0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED} };
-#endif
-#ifndef GUID_DEVINTERFACE_USB_HUB
-const GUID GUID_DEVINTERFACE_USB_HUB = { 0xF18A0E88, 0xC30C, 0x11D0, {0x88, 0x15, 0x00, 0xA0, 0xC9, 0x06, 0xBE, 0xD8} };
-#endif
-#ifndef GUID_DEVINTERFACE_LIBUSB0_FILTER
-const GUID GUID_DEVINTERFACE_LIBUSB0_FILTER = { 0xF9F3FF14, 0xAE21, 0x48A0, {0x8A, 0x25, 0x80, 0x11, 0xA7, 0xA9, 0x31, 0xD9} };
-#endif
-
-
 /*
  * Multiple USB API backend support
  */
@@ -95,7 +78,7 @@ const GUID GUID_DEVINTERFACE_LIBUSB0_FILTER = { 0xF9F3FF14, 0xAE21, 0x48A0, {0x8
 #define SUB_API_WINUSB		2
 #define SUB_API_MAX		3
 
-#define WINUSBX_DRV_NAMES	{"libusbK", "libusb0", "WinUSB"}
+#define WINUSBX_DRV_NAMES	{ "libusbK", "libusb0", "WinUSB" }
 
 struct windows_usb_api_backend {
 	const uint8_t id;
@@ -119,8 +102,6 @@ struct windows_usb_api_backend {
 	int (*abort_transfers)(int sub_api, struct usbi_transfer *itransfer);
 	int (*copy_transfer_data)(int sub_api, struct usbi_transfer *itransfer, uint32_t io_size);
 };
-
-extern const struct windows_usb_api_backend usb_api_backend[USB_API_MAX];
 
 #define PRINT_UNSUPPORTED_API(fname)				\
 	usbi_dbg("unsupported API call for '"			\
@@ -154,15 +135,45 @@ struct libusb_hid_descriptor {
 #define LIBUSB_REQ_IN(request_type)		((request_type) & LIBUSB_ENDPOINT_IN)
 #define LIBUSB_REQ_OUT(request_type)		(!LIBUSB_REQ_IN(request_type))
 
+#ifndef METHOD_BUFFERED
+#define METHOD_BUFFERED				0
+#endif
+#ifndef METHOD_IN_DIRECT
+#define METHOD_IN_DIRECT			1
+#endif
+#ifndef METHOD_OUT_DIRECT
+#define METHOD_OUT_DIRECT			2
+#endif
+#ifndef METHOD_NEITHER
+#define METHOD_NEITHER				3
+#endif
+#ifndef FILE_ANY_ACCESS
+#define FILE_ANY_ACCESS				0x00000000
+#endif
+#ifndef FILE_DEVICE_UNKNOWN
+#define FILE_DEVICE_UNKNOWN			0x00000022
+#endif
+#ifndef FILE_DEVICE_KEYBOARD
+#define FILE_DEVICE_KEYBOARD			0x0000000b
+#endif
+#ifndef FILE_DEVICE_USB
+#define FILE_DEVICE_USB				FILE_DEVICE_UNKNOWN
+#endif
+
+#ifndef CTL_CODE
+#define CTL_CODE(DeviceType, Function, Method, Access) \
+	(((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
+#endif
+
 // The following are used for HID reports IOCTLs
 #define HID_CTL_CODE(id) \
-	CTL_CODE (FILE_DEVICE_KEYBOARD, (id), METHOD_NEITHER, FILE_ANY_ACCESS)
+	CTL_CODE(FILE_DEVICE_KEYBOARD, (id), METHOD_NEITHER, FILE_ANY_ACCESS)
 #define HID_BUFFER_CTL_CODE(id) \
-	CTL_CODE (FILE_DEVICE_KEYBOARD, (id), METHOD_BUFFERED, FILE_ANY_ACCESS)
+	CTL_CODE(FILE_DEVICE_KEYBOARD, (id), METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define HID_IN_CTL_CODE(id) \
-	CTL_CODE (FILE_DEVICE_KEYBOARD, (id), METHOD_IN_DIRECT, FILE_ANY_ACCESS)
+	CTL_CODE(FILE_DEVICE_KEYBOARD, (id), METHOD_IN_DIRECT, FILE_ANY_ACCESS)
 #define HID_OUT_CTL_CODE(id) \
-	CTL_CODE (FILE_DEVICE_KEYBOARD, (id), METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+	CTL_CODE(FILE_DEVICE_KEYBOARD, (id), METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 
 #define IOCTL_HID_GET_FEATURE		HID_OUT_CTL_CODE(100)
 #define IOCTL_HID_GET_INPUT_REPORT	HID_OUT_CTL_CODE(104)
@@ -197,125 +208,12 @@ struct hid_device_priv {
 	uint8_t string_index[3]; // man, prod, ser
 };
 
-struct windows_device_priv {
-	uint8_t depth; // distance to HCD
-	uint8_t port;  // port number on the hub
-	uint8_t active_config;
-	struct windows_usb_api_backend const *apib;
-	char *path;  // device interface path
-	int sub_api; // for WinUSB-like APIs
-	struct {
-		char *path; // each interface needs a device interface path,
-		struct windows_usb_api_backend const *apib; // an API backend (multiple drivers support),
-		int sub_api;
-		int8_t nb_endpoints; // and a set of endpoint addresses (USB_MAXENDPOINTS)
-		uint8_t *endpoint;
-		bool restricted_functionality;  // indicates if the interface functionality is restricted
-                                                // by Windows (eg. HID keyboards or mice cannot do R/W)
-	} usb_interface[USB_MAXINTERFACES];
-	struct hid_device_priv *hid;
-	USB_DEVICE_DESCRIPTOR dev_descriptor;
-	unsigned char **config_descriptor; // list of pointers to the cached config descriptors
-};
-
-static inline struct windows_device_priv *_device_priv(struct libusb_device *dev)
-{
-	return (struct windows_device_priv *)dev->os_priv;
-}
-
-static inline struct windows_device_priv *windows_device_priv_init(struct libusb_device *dev)
-{
-	struct windows_device_priv *p = _device_priv(dev);
-	int i;
-
-	p->apib = &usb_api_backend[USB_API_UNSUPPORTED];
-	p->sub_api = SUB_API_NOTSET;
-	for (i = 0; i < USB_MAXINTERFACES; i++) {
-		p->usb_interface[i].apib = &usb_api_backend[USB_API_UNSUPPORTED];
-		p->usb_interface[i].sub_api = SUB_API_NOTSET;
-	}
-
-	return p;
-}
-
-static inline void windows_device_priv_release(struct libusb_device *dev)
-{
-	struct windows_device_priv *p = _device_priv(dev);
-	int i;
-
-	free(p->path);
-	if ((dev->num_configurations > 0) && (p->config_descriptor != NULL)) {
-		for (i = 0; i < dev->num_configurations; i++)
-			free(p->config_descriptor[i]);
-	}
-	free(p->config_descriptor);
-	free(p->hid);
-	for (i = 0; i < USB_MAXINTERFACES; i++) {
-		free(p->usb_interface[i].path);
-		free(p->usb_interface[i].endpoint);
-	}
-}
-
-struct interface_handle_t {
-	HANDLE dev_handle; // WinUSB needs an extra handle for the file
-	HANDLE api_handle; // used by the API to communicate with the device
-};
-
-struct windows_device_handle_priv {
-	int active_interface;
-	struct interface_handle_t interface_handle[USB_MAXINTERFACES];
-	int autoclaim_count[USB_MAXINTERFACES]; // For auto-release
-};
-
-static inline struct windows_device_handle_priv *_device_handle_priv(
-	struct libusb_device_handle *handle)
-{
-	return (struct windows_device_handle_priv *)handle->os_priv;
-}
-
-// used for async polling functions
-struct windows_transfer_priv {
-	struct winfd pollable_fd;
-	uint8_t interface_number;
-	uint8_t *hid_buffer; // 1 byte extended data buffer, required for HID
-	uint8_t *hid_dest;   // transfer buffer destination, required for HID
-	size_t hid_expected_size;
-};
-
 // used to match a device driver (including filter drivers) against a supported API
 struct driver_lookup {
 	char list[MAX_KEY_LENGTH + 1]; // REG_MULTI_SZ list of services (driver) names
 	const DWORD reg_prop;          // SPDRP registry key to use to retrieve list
 	const char* designation;       // internal designation (for debug output)
 };
-
-/* OLE32 dependency */
-DLL_DECLARE_HANDLE(OLE32);
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, HRESULT, p, CLSIDFromString, (LPCOLESTR, LPCLSID));
-
-/* Kernel32 dependencies */
-DLL_DECLARE_HANDLE(Kernel32);
-/* This call is only available from XP SP2 */
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, IsWow64Process, (HANDLE, PBOOL));
-
-/* SetupAPI dependencies */
-DLL_DECLARE_HANDLE(SetupAPI);
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, HDEVINFO, p, SetupDiGetClassDevsA, (const GUID*, PCSTR, HWND, DWORD));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, SetupDiEnumDeviceInfo, (HDEVINFO, DWORD, PSP_DEVINFO_DATA));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, SetupDiEnumDeviceInterfaces, (HDEVINFO, PSP_DEVINFO_DATA,
-			const GUID*, DWORD, PSP_DEVICE_INTERFACE_DATA));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, SetupDiGetDeviceInterfaceDetailA, (HDEVINFO, PSP_DEVICE_INTERFACE_DATA,
-			PSP_DEVICE_INTERFACE_DETAIL_DATA_A, DWORD, PDWORD, PSP_DEVINFO_DATA));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, SetupDiDestroyDeviceInfoList, (HDEVINFO));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, HKEY, p, SetupDiOpenDevRegKey, (HDEVINFO, PSP_DEVINFO_DATA, DWORD, DWORD, DWORD, REGSAM));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, SetupDiGetDeviceRegistryPropertyA, (HDEVINFO,
-			PSP_DEVINFO_DATA, DWORD, PDWORD, PBYTE, DWORD, PDWORD));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, HKEY, p, SetupDiOpenDeviceInterfaceRegKey, (HDEVINFO, PSP_DEVICE_INTERFACE_DATA, DWORD, DWORD));
-
-/* AdvAPI32 dependencies */
-DLL_DECLARE_HANDLE(AdvAPI32);
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, LONG, p, RegQueryValueExW, (HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, LONG, p, RegCloseKey, (HKEY));
 
 /*
  * Windows DDK API definitions. Most of it copied from MinGW's includes
@@ -337,23 +235,12 @@ typedef RETURN_TYPE CONFIGRET;
 #define USB_GET_NODE_CONNECTION_INFORMATION_EX_V2	279
 #endif
 
-#ifndef METHOD_BUFFERED
-#define METHOD_BUFFERED				0
-#endif
-#ifndef FILE_ANY_ACCESS
-#define FILE_ANY_ACCESS				0x00000000
-#endif
-#ifndef FILE_DEVICE_UNKNOWN
-#define FILE_DEVICE_UNKNOWN			0x00000022
-#endif
-#ifndef FILE_DEVICE_USB
-#define FILE_DEVICE_USB				FILE_DEVICE_UNKNOWN
-#endif
+#define USB_CTL_CODE(id) \
+	CTL_CODE(FILE_DEVICE_USB, (id), METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-#ifndef CTL_CODE
-#define CTL_CODE(DeviceType, Function, Method, Access) \
-	(((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
-#endif
+#define IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION	USB_CTL_CODE(USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION)
+#define IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX	USB_CTL_CODE(USB_GET_NODE_CONNECTION_INFORMATION_EX)
+#define IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2	USB_CTL_CODE(USB_GET_NODE_CONNECTION_INFORMATION_EX_V2)
 
 typedef enum USB_CONNECTION_STATUS {
 	NoDeviceConnected,
@@ -371,22 +258,6 @@ typedef enum USB_HUB_NODE {
 	UsbHub,
 	UsbMIParent
 } USB_HUB_NODE;
-
-/* Cfgmgr32.dll interface */
-DLL_DECLARE_HANDLE(Cfgmgr32);
-DLL_DECLARE_FUNC(WINAPI, CONFIGRET, CM_Get_Parent, (PDEVINST, DEVINST, ULONG));
-DLL_DECLARE_FUNC(WINAPI, CONFIGRET, CM_Get_Child, (PDEVINST, DEVINST, ULONG));
-DLL_DECLARE_FUNC(WINAPI, CONFIGRET, CM_Get_Sibling, (PDEVINST, DEVINST, ULONG));
-DLL_DECLARE_FUNC(WINAPI, CONFIGRET, CM_Get_Device_IDA, (DEVINST, PCHAR, ULONG, ULONG));
-
-#define IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION \
-	CTL_CODE(FILE_DEVICE_USB, USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-#define IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX \
-	CTL_CODE(FILE_DEVICE_USB, USB_GET_NODE_CONNECTION_INFORMATION_EX, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-#define IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2 \
-	CTL_CODE(FILE_DEVICE_USB, USB_GET_NODE_CONNECTION_INFORMATION_EX_V2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // Most of the structures below need to be packed
 #include <pshpack1.h>
@@ -783,21 +654,3 @@ typedef struct _HIDP_VALUE_CAPS {
 		} NotRange;
 	} u;
 } HIDP_VALUE_CAPS, *PHIDP_VALUE_CAPS;
-
-DLL_DECLARE_HANDLE(hid);
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetAttributes, (HANDLE, PHIDD_ATTRIBUTES));
-DLL_DECLARE_FUNC(WINAPI, VOID, HidD_GetHidGuid, (LPGUID));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetPreparsedData, (HANDLE, PHIDP_PREPARSED_DATA *));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_FreePreparsedData, (PHIDP_PREPARSED_DATA));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetManufacturerString, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetProductString, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetSerialNumberString, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, LONG, HidP_GetCaps, (PHIDP_PREPARSED_DATA, PHIDP_CAPS));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_SetNumInputBuffers, (HANDLE, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_SetFeature, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetFeature, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetPhysicalDescriptor, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_GetInputReport, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_SetOutputReport, (HANDLE, PVOID, ULONG));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidD_FlushQueue, (HANDLE));
-DLL_DECLARE_FUNC(WINAPI, BOOL, HidP_GetValueCaps, (HIDP_REPORT_TYPE, PHIDP_VALUE_CAPS, PULONG, PHIDP_PREPARSED_DATA));

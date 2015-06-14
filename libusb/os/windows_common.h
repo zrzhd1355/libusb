@@ -52,6 +52,11 @@
 #define ARRAYSIZE(A) (sizeof(A)/sizeof((A)[0]))
 #endif
 
+// Missing from MinGW
+#if !defined(FACILITY_SETUPAPI)
+#define FACILITY_SETUPAPI	15
+#endif
+
 #define ERR_BUFFER_SIZE	256
 
 /*
@@ -75,7 +80,7 @@
 	do {							\
 		__dll_##name##_handle = DLL_LOAD_LIBRARY(name);	\
 		if (!__dll_##name##_handle)			\
-			return LIBUSB_ERROR_OTHER;		\
+			return FALSE;				\
 	} while (0)
 
 #define DLL_FREE_HANDLE(name)					\
@@ -115,7 +120,7 @@
 		if (prefixname)						\
 			break;						\
 		if (ret_on_failure)					\
-			return LIBUSB_ERROR_NOT_FOUND;			\
+			return FALSE;					\
 	} while(0)
 
 #define DLL_LOAD_FUNC(dll, name, ret_on_failure)			\

@@ -23,22 +23,12 @@
 
 #include <config.h>
 
-#if defined(USE_USBDK)
-
 #include <windows.h>
-#include <cfgmgr32.h>
 #include <stdio.h>
 
 #include "libusbi.h"
 #include "windows_common.h"
 #include "windows_nt_common.h"
-
-#define ULONG64 uint64_t
-#define PVOID64 uint64_t
-
-typedef CONST WCHAR *PCWCHAR;
-#define wcsncpy_s wcsncpy
-
 #include "windows_usbdk.h"
 
 #if !defined(STATUS_SUCCESS)
@@ -68,23 +58,10 @@ typedef int32_t USBD_STATUS;
 
 static int concurrent_usage = -1;
 
-struct usbdk_device_priv {
-	USB_DK_DEVICE_INFO info;
-	PUSB_CONFIGURATION_DESCRIPTOR *config_descriptors;
-	HANDLE redirector_handle;
-	uint8_t active_configuration;
-};
-
-struct usbdk_transfer_priv {
-	USB_DK_TRANSFER_REQUEST request;
-	struct winfd pollable_fd;
-	PULONG64 IsochronousPacketsArray;
-	PUSB_DK_ISO_TRANSFER_RESULT IsochronousResultsArray;
-};
-
 static inline struct usbdk_device_priv *_usbdk_device_priv(struct libusb_device *dev)
 {
-	return (struct usbdk_device_priv *)dev->os_priv;
+	union windows_device_priv *priv = (union windows_device_priv *)dev->os_priv;
+	return &priv->usbdk_priv;
 }
 
 static inline struct usbdk_transfer_priv *_usbdk_transfer_priv(struct usbi_transfer *itransfer)
@@ -115,7 +92,7 @@ static FARPROC get_usbdk_proc_addr(struct libusb_context *ctx, LPCSTR api_name)
 	FARPROC api_ptr = GetProcAddress(usbdk_helper.module, api_name);
 
 	if (api_ptr == NULL)
-		usbi_err(ctx, "UsbDkHelper API %s not found, error %d", api_name, GetLastError());
+		usbi_err(ctx, "UsbDkHelper API %s not found: %s", api_name, windows_error_str(0));
 
 	return api_ptr;
 }
@@ -132,7 +109,7 @@ static int load_usbdk_helper_dll(struct libusb_context *ctx)
 {
 	usbdk_helper.module = LoadLibraryA("UsbDkHelper");
 	if (usbdk_helper.module == NULL) {
-		usbi_err(ctx, "Failed to load UsbDkHelper.dll, error %d", GetLastError());
+		usbi_err(ctx, "Failed to load UsbDkHelper.dll: %s", windows_error_str(0));
 		return LIBUSB_ERROR_NOT_FOUND;
 	}
 
@@ -198,33 +175,32 @@ error_unload:
 
 static int usbdk_init(struct libusb_context *ctx)
 {
-	int r;
+	SC_HANDLE managerHandle;
+	SC_HANDLE serviceHandle;
 
-	if (++concurrent_usage == 0) { // First init?
-		r = load_usbdk_helper_dll(ctx);
-		if (r)
-			goto init_exit;
-
-		init_polling();
-
-		r = windows_common_init(ctx);
-		if (r)
-			goto init_exit;
-	}
-	// At this stage, either we went through full init successfully, or didn't need to
-	r = LIBUSB_SUCCESS;
-
-init_exit:
-	if (!concurrent_usage && r != LIBUSB_SUCCESS) { // First init failed?
-		exit_polling();
-		windows_common_exit();
-		unload_usbdk_helper_dll();
+	managerHandle = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+	if (managerHandle == NULL) {
+		usbi_warn(ctx, "failed to open service control manager: %s", windows_error_str(0));
+		return LIBUSB_ERROR_OTHER;
 	}
 
-	if (r != LIBUSB_SUCCESS)
-		--concurrent_usage; // Not expected to call libusb_exit if we failed.
+	serviceHandle = OpenServiceA(managerHandle, "UsbDk", GENERIC_READ);
+	CloseServiceHandle(managerHandle);
 
-	return r;
+	if (serviceHandle == NULL) {
+		usbi_warn(ctx, "failed to open UsbDk service: %s", windows_error_str(0));
+		return LIBUSB_ERROR_NOT_FOUND;
+	}
+
+	CloseServiceHandle(serviceHandle);
+
+	return load_usbdk_helper_dll(ctx);
+}
+
+static void usbdk_exit(struct libusb_context *ctx)
+{
+	UNUSED(ctx);
+	unload_usbdk_helper_dll();
 }
 
 static int usbdk_get_session_id_for_device(struct libusb_context *ctx,
@@ -300,7 +276,7 @@ static void usbdk_device_init(libusb_device *dev, PUSB_DK_DEVICE_INFO info)
 	dev->device_address = (uint8_t)(info->Port + 1);
 
 	dev->num_configurations = info->DeviceDescriptor.bNumConfigurations;
-	dev->device_descriptor = info->DeviceDescriptor;
+	memcpy(&dev->device_descriptor, &info->DeviceDescriptor, LIBUSB_DT_DEVICE_SIZE);
 
 	switch (info->Speed) {
 	case LowSpeed:
@@ -371,27 +347,16 @@ func_exit:
 	return r;
 }
 
-static void usbdk_exit(struct libusb_context *ctx)
-{
-	UNUSED(ctx);
-	if (--concurrent_usage < 0) {
-		windows_common_exit();
-		exit_polling();
-		unload_usbdk_helper_dll();
-	}
-}
-
-static int usbdk_get_device_descriptor(struct libusb_device *dev, unsigned char *buffer, int *host_endian)
+static int usbdk_get_device_descriptor(struct libusb_device *dev, unsigned char *buffer)
 {
 	struct usbdk_device_priv *priv = _usbdk_device_priv(dev);
 
 	memcpy(buffer, &priv->info.DeviceDescriptor, DEVICE_DESC_LENGTH);
-	*host_endian = 0;
 
 	return LIBUSB_SUCCESS;
 }
 
-static int usbdk_get_config_descriptor(struct libusb_device *dev, uint8_t config_index, unsigned char *buffer, size_t len, int *host_endian)
+static int usbdk_get_config_descriptor(struct libusb_device *dev, uint8_t config_index, unsigned char *buffer, size_t len)
 {
 	struct usbdk_device_priv *priv = _usbdk_device_priv(dev);
 	PUSB_CONFIGURATION_DESCRIPTOR config_header;
@@ -404,15 +369,13 @@ static int usbdk_get_config_descriptor(struct libusb_device *dev, uint8_t config
 
 	size = min(config_header->wTotalLength, len);
 	memcpy(buffer, config_header, size);
-	*host_endian = 0;
-
 	return (int)size;
 }
 
-static inline int usbdk_get_active_config_descriptor(struct libusb_device *dev, unsigned char *buffer, size_t len, int *host_endian)
+static inline int usbdk_get_active_config_descriptor(struct libusb_device *dev, unsigned char *buffer, size_t len)
 {
 	return usbdk_get_config_descriptor(dev, _usbdk_device_priv(dev)->active_configuration,
-			buffer, len, host_endian);
+			buffer, len);
 }
 
 static int usbdk_open(struct libusb_device_handle *dev_handle)
@@ -534,7 +497,7 @@ static void usbdk_destroy_device(struct libusb_device *dev)
 		usbdk_release_config_descriptors(p, p->info.DeviceDescriptor.bNumConfigurations);
 }
 
-void windows_clear_transfer_priv(struct usbi_transfer *itransfer)
+static void usbdk_clear_transfer_priv(struct usbi_transfer *itransfer)
 {
 	struct usbdk_transfer_priv *transfer_priv = _usbdk_transfer_priv(itransfer);
 	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
@@ -565,7 +528,7 @@ static int usbdk_do_control_transfer(struct usbi_transfer *itransfer)
 	if (wfd.fd < 0)
 		return LIBUSB_ERROR_NO_MEM;
 
-	transfer_priv->request.Buffer = (PVOID64)(uintptr_t)transfer->buffer;
+	transfer_priv->request.Buffer = (PVOID64)transfer->buffer;
 	transfer_priv->request.BufferLength = transfer->length;
 	transfer_priv->request.TransferType = ControlTransferType;
 	transfer_priv->pollable_fd = INVALID_WINFD;
@@ -606,7 +569,7 @@ static int usbdk_do_bulk_transfer(struct usbi_transfer *itransfer)
 	TransferResult transferRes;
 	HANDLE sysHandle;
 
-	transfer_priv->request.Buffer = (PVOID64)(uintptr_t)transfer->buffer;
+	transfer_priv->request.Buffer = (PVOID64)transfer->buffer;
 	transfer_priv->request.BufferLength = transfer->length;
 	transfer_priv->request.EndpointAddress = transfer->endpoint;
 
@@ -665,20 +628,20 @@ static int usbdk_do_iso_transfer(struct usbi_transfer *itransfer)
 	int i;
 	HANDLE sysHandle;
 
-	transfer_priv->request.Buffer = (PVOID64)(uintptr_t)transfer->buffer;
+	transfer_priv->request.Buffer = (PVOID64)transfer->buffer;
 	transfer_priv->request.BufferLength = transfer->length;
 	transfer_priv->request.EndpointAddress = transfer->endpoint;
 	transfer_priv->request.TransferType = IsochronousTransferType;
 	transfer_priv->request.IsochronousPacketsArraySize = transfer->num_iso_packets;
 	transfer_priv->IsochronousPacketsArray = malloc(transfer->num_iso_packets * sizeof(ULONG64));
-	transfer_priv->request.IsochronousPacketsArray = (PVOID64)(uintptr_t)transfer_priv->IsochronousPacketsArray;
+	transfer_priv->request.IsochronousPacketsArray = (PVOID64)transfer_priv->IsochronousPacketsArray;
 	if (!transfer_priv->IsochronousPacketsArray) {
 		usbi_err(ctx, "Allocation of IsochronousPacketsArray is failed, %s", windows_error_str(0));
 		return LIBUSB_ERROR_IO;
 	}
 
 	transfer_priv->IsochronousResultsArray = malloc(transfer->num_iso_packets * sizeof(USB_DK_ISO_TRANSFER_RESULT));
-	transfer_priv->request.Result.IsochronousResultsArray = (PVOID64)(uintptr_t)transfer_priv->IsochronousResultsArray;
+	transfer_priv->request.Result.IsochronousResultsArray = (PVOID64)transfer_priv->IsochronousResultsArray;
 	if (!transfer_priv->IsochronousResultsArray) {
 		usbi_err(ctx, "Allocation of isochronousResultsArray is failed, %s", windows_error_str(0));
 		free(transfer_priv->IsochronousPacketsArray);
@@ -779,13 +742,13 @@ static int usbdk_cancel_transfer(struct usbi_transfer *itransfer)
 	}
 }
 
-int windows_copy_transfer_data(struct usbi_transfer *itransfer, uint32_t io_size)
+static int usbdk_copy_transfer_data(struct usbi_transfer *itransfer, uint32_t io_size)
 {
 	itransfer->transferred += io_size;
 	return LIBUSB_TRANSFER_COMPLETED;
 }
 
-struct winfd *windows_get_fd(struct usbi_transfer *transfer)
+static struct winfd *usbdk_get_fd(struct usbi_transfer *transfer)
 {
 	struct usbdk_transfer_priv *transfer_priv = _usbdk_transfer_priv(transfer);
 	return &transfer_priv->pollable_fd;
@@ -806,7 +769,7 @@ static DWORD usbdk_translate_usbd_status(USBD_STATUS UsbdStatus)
 	}
 }
 
-void windows_get_overlapped_result(struct usbi_transfer *transfer, struct winfd *pollable_fd, DWORD *io_result, DWORD *io_size)
+static void usbdk_get_overlapped_result(struct usbi_transfer *transfer, struct winfd *pollable_fd, DWORD *io_result, DWORD *io_size)
 {
 	if (HasOverlappedIoCompletedSync(pollable_fd->overlapped) // Handle async requests that completed synchronously first
 			|| GetOverlappedResult(pollable_fd->handle, pollable_fd->overlapped, io_size, false)) { // Regular async overlapped
@@ -841,64 +804,28 @@ void windows_get_overlapped_result(struct usbi_transfer *transfer, struct winfd 
 	}
 }
 
-static int usbdk_clock_gettime(int clk_id, struct timespec *tp)
-{
-	return windows_clock_gettime(clk_id, tp);
-}
-
-const struct usbi_os_backend usbi_backend = {
-	"Windows",
-	USBI_CAP_HAS_HID_ACCESS,
+const struct windows_backend usbdk_backend = {
 	usbdk_init,
 	usbdk_exit,
-	NULL,	// set_option()
-
 	usbdk_get_device_list,
-	NULL,
 	usbdk_open,
 	usbdk_close,
-
 	usbdk_get_device_descriptor,
 	usbdk_get_active_config_descriptor,
 	usbdk_get_config_descriptor,
-	NULL,
-
+	NULL,//usbdk_get_config_descriptor_by_value,
 	usbdk_get_configuration,
 	usbdk_set_configuration,
 	usbdk_claim_interface,
 	usbdk_release_interface,
-
 	usbdk_set_interface_altsetting,
 	usbdk_clear_halt,
 	usbdk_reset_device,
-
-	NULL,
-	NULL,
-
-	NULL,	// dev_mem_alloc()
-	NULL,	// dev_mem_free()
-
-	usbdk_kernel_driver_active,
-	usbdk_detach_kernel_driver,
-	usbdk_attach_kernel_driver,
-
 	usbdk_destroy_device,
-
 	usbdk_submit_transfer,
 	usbdk_cancel_transfer,
-	windows_clear_transfer_priv,
-
-	windows_handle_events,
-	NULL,
-
-	usbdk_clock_gettime,
-#if defined(USBI_TIMERFD_AVAILABLE)
-	NULL,
-#endif
-	0,
-	sizeof(struct usbdk_device_priv),
-	0,
-	sizeof(struct usbdk_transfer_priv),
+	usbdk_clear_transfer_priv,
+	usbdk_copy_transfer_data,
+	usbdk_get_fd,
+	usbdk_get_overlapped_result,
 };
-
-#endif /* USE_USBDK */
