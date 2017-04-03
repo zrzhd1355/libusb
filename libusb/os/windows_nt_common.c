@@ -58,6 +58,12 @@ DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, PostThreadMessageA, (DWORD, UINT, WPA
 
 static unsigned __stdcall windows_clock_gettime_threaded(void *param);
 
+// CancelIoEx, available on Vista and later only, provides the ability to cancel
+// a single transfer (OVERLAPPED) when used. As it may not be part of any of the
+// platform headers, we hook into the Kernel32 system DLL directly to seek it.
+DLL_DECLARE_HANDLE(Kernel32);
+static BOOL(__stdcall *pCancelIoEx)(HANDLE, LPOVERLAPPED) = NULL;
+
 /*
 * Converts a windows error to human readable string
 * uses retval as errorcode, or, if 0, use GetLastError()
@@ -258,6 +264,11 @@ out_unlock:
 
 static int windows_init_dlls(void)
 {
+	DLL_GET_HANDLE(Kernel32);
+	DLL_LOAD_FUNC_PREFIXED(Kernel32, p, CancelIoEx, FALSE);
+	usbi_dbg("Will use CancelIo%s for I/O cancellation",
+		pCancelIoEx ? "Ex" : "");
+
 	DLL_GET_HANDLE(User32);
 	DLL_LOAD_FUNC_PREFIXED(User32, p, GetMessageA, TRUE);
 	DLL_LOAD_FUNC_PREFIXED(User32, p, PeekMessageA, TRUE);
@@ -268,6 +279,7 @@ static int windows_init_dlls(void)
 
 static void windows_exit_dlls(void)
 {
+	DLL_FREE_HANDLE(Kernel32);
 	DLL_FREE_HANDLE(User32);
 }
 
@@ -460,7 +472,7 @@ int windows_clock_gettime(int clk_id, struct timespec *tp)
 	}
 }
 
-static void windows_transfer_callback(struct usbi_transfer *itransfer, uint32_t io_result, uint32_t io_size)
+static void windows_transfer_callback(struct usbi_transfer *itransfer, DWORD io_result, DWORD io_size)
 {
 	int status, istatus;
 
@@ -498,7 +510,7 @@ static void windows_transfer_callback(struct usbi_transfer *itransfer, uint32_t 
 		usbi_handle_transfer_completion(itransfer, (enum libusb_transfer_status)status);
 }
 
-void windows_handle_callback(struct usbi_transfer *itransfer, uint32_t io_result, uint32_t io_size)
+void windows_handle_callback(struct usbi_transfer *itransfer, DWORD io_result, DWORD io_size)
 {
 	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 
@@ -517,32 +529,23 @@ void windows_handle_callback(struct usbi_transfer *itransfer, uint32_t io_result
 	}
 }
 
-int windows_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYPE nfds, int num_ready)
+int windows_handle_events(struct libusb_context *ctx, void *event_data, unsigned int cnt, int num_ready)
 {
-	POLL_NFDS_TYPE i;
-	bool found = false;
-	struct usbi_transfer *transfer;
-	struct winfd *pollable_fd = NULL;
+	HANDLE *handles = (HANDLE *)event_data;
+	struct usbi_transfer *itransfer;
+	struct windows_transfer_priv *transfer_priv;
+	bool found;
+	unsigned int i;
 	DWORD io_size, io_result;
-	int r = LIBUSB_SUCCESS;
 
 	usbi_mutex_lock(&ctx->open_devs_lock);
-	for (i = 0; i < nfds && num_ready > 0; i++) {
-
-		usbi_dbg("checking fd %d with revents = %04x", fds[i].fd, fds[i].revents);
-
-		if (!fds[i].revents)
-			continue;
-
-		num_ready--;
-
-		// Because a Windows OVERLAPPED is used for poll emulation,
-		// a pollable fd is created and stored with each transfer
-		usbi_mutex_lock(&ctx->flying_transfers_lock);
+	for (i = 0; i < cnt; i++) {
+		transfer_priv = NULL;
 		found = false;
-		list_for_each_entry(transfer, &ctx->flying_transfers, list, struct usbi_transfer) {
-			pollable_fd = windows_get_fd(transfer);
-			if (pollable_fd->fd == fds[i].fd) {
+		usbi_mutex_lock(&ctx->flying_transfers_lock);
+		list_for_each_entry(itransfer, &ctx->flying_transfers, list, struct usbi_transfer) {
+			transfer_priv = usbi_transfer_get_os_priv(itransfer);
+			if (transfer_priv->overlapped.hEvent == handles[i]) {
 				found = true;
 				break;
 			}
@@ -550,22 +553,86 @@ int windows_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_N
 		usbi_mutex_unlock(&ctx->flying_transfers_lock);
 
 		if (found) {
-			windows_get_overlapped_result(transfer, pollable_fd, &io_result, &io_size);
-
-			usbi_remove_pollfd(ctx, pollable_fd->fd);
-			// let handle_callback free the event using the transfer wfd
-			// If you don't use the transfer wfd, you run a risk of trying to free a
-			// newly allocated wfd that took the place of the one from the transfer.
-			windows_handle_callback(transfer, io_result, io_size);
+			// Handle async requests that completed synchronously first
+			if (HasOverlappedIoCompletedSync(&transfer_priv->overlapped)) {
+				io_result = NO_ERROR;
+				io_size = (DWORD)transfer_priv->overlapped.InternalHigh;
+			// Regular async overlapped
+			} else if (GetOverlappedResult(transfer_priv->handle,
+				&transfer_priv->overlapped, &io_size, false)) {
+				io_result = NO_ERROR;
+			} else {
+				io_result = GetLastError();
+				if (io_result == ERROR_IO_INCOMPLETE) {
+					// Transfer still in progress, skip
+					continue;
+				}
+			}
+			windows_handle_callback(itransfer, io_result, io_size);
 		} else {
-			usbi_err(ctx, "could not find a matching transfer for fd %d", fds[i]);
-			r = LIBUSB_ERROR_NOT_FOUND;
-			break;
+			// This can occur if the transfer overlapped event was added to the event
+			// sources list but transfer submission failed and it hasn't been removed yet
+			usbi_warn(ctx, "could not find a matching transfer for HANDLE %p", handles[i]);
+			continue;
 		}
 	}
 	usbi_mutex_unlock(&ctx->open_devs_lock);
 
-	return r;
+	return LIBUSB_SUCCESS;
+}
+
+int prepare_overlapped(struct libusb_context *ctx, struct windows_overlapped *ov, HANDLE handle)
+{
+	int r;
+
+	memset(&ov->overlapped, 0, sizeof(ov->overlapped));
+	ov->overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (ov->overlapped.hEvent == NULL)
+		return LIBUSB_ERROR_NO_MEM;
+
+	r = usbi_add_event_source(ctx, ov->overlapped.hEvent, 0);
+	if (r) {
+		CloseHandle(ov->overlapped.hEvent);
+		ov->overlapped.hEvent = NULL;
+		return r;
+	}
+
+	if (!pCancelIoEx && DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(),
+		&ov->handle, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+		// Attempt to emulate some of the CancelIoEx behaviour on platforms
+		// that don't have it
+		ov->original_handle = handle;
+		ov->thread_id = GetCurrentThreadId();
+	} else {
+		// When CancelIoEx is available or DuplicateHandle fails,
+		// use the original handle
+		ov->handle = handle;
+		ov->original_handle = NULL;
+	}
+
+	return LIBUSB_SUCCESS;
+}
+
+void cancel_overlapped(struct libusb_context *ctx, struct windows_overlapped *ov)
+{
+	if (pCancelIoEx) {
+		if (!pCancelIoEx(ov->handle, &ov->overlapped))
+			usbi_warn(ctx, "Unable to cancel I/O: %s", windows_error_str(0));
+	} else if (ov->thread_id == GetCurrentThreadId()) {
+		if (!CancelIo(ov->handle))
+			usbi_warn(ctx, "Unable to cancel I/O: %s", windows_error_str(0));
+	} else {
+		usbi_warn(ctx, "Unable to cancel I/O that was started from another thread");
+	}
+}
+
+void clear_overlapped(struct libusb_context *ctx, OVERLAPPED *overlapped)
+{
+	if (overlapped->hEvent) {
+		usbi_remove_event_source(ctx, overlapped->hEvent);
+		CloseHandle(overlapped->hEvent);
+		overlapped->hEvent = NULL;
+	}
 }
 
 int windows_common_init(struct libusb_context *ctx)

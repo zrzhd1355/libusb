@@ -1193,44 +1193,6 @@ void API_EXPORTED libusb_unref_device(libusb_device *dev)
 	}
 }
 
-/*
- * Signal the event pipe so that the event handling thread will be
- * interrupted to process an internal event.
- */
-int usbi_signal_event(struct libusb_context *ctx)
-{
-	unsigned char dummy = 1;
-	ssize_t r;
-
-	/* write some data on event pipe to interrupt event handlers */
-	r = usbi_write(ctx->event_pipe[1], &dummy, sizeof(dummy));
-	if (r != sizeof(dummy)) {
-		usbi_warn(ctx, "internal signalling write failed");
-		return LIBUSB_ERROR_IO;
-	}
-
-	return 0;
-}
-
-/*
- * Clear the event pipe so that the event handling will no longer be
- * interrupted.
- */
-int usbi_clear_event(struct libusb_context *ctx)
-{
-	unsigned char dummy;
-	ssize_t r;
-
-	/* read some data on event pipe to clear it */
-	r = usbi_read(ctx->event_pipe[0], &dummy, sizeof(dummy));
-	if (r != sizeof(dummy)) {
-		usbi_warn(ctx, "internal signalling read failed");
-		return LIBUSB_ERROR_IO;
-	}
-
-	return 0;
-}
-
 /** \ingroup libusb_dev
  * Open a device and obtain a device handle. A handle allows you to perform
  * I/O on the device in question.
@@ -1428,8 +1390,8 @@ void API_EXPORTED libusb_close(libusb_device_handle *dev_handle)
 	/* Similarly to libusb_open(), we want to interrupt all event handlers
 	 * at this point. More importantly, we want to perform the actual close of
 	 * the device while holding the event handling lock (preventing any other
-	 * thread from doing event handling) because we will be removing a file
-	 * descriptor from the polling loop. If this is being called by the current
+	 * thread from doing event handling) because we may be removing an event
+	 * source from the polling loop. If this is being called by the current
 	 * event handler, we can bypass the interruption code because we already
 	 * hold the event handling lock. */
 
@@ -1440,7 +1402,7 @@ void API_EXPORTED libusb_close(libusb_device_handle *dev_handle)
 		pending_events = usbi_pending_events(ctx);
 		ctx->device_close++;
 		if (!pending_events)
-			usbi_signal_event(ctx);
+			usbi_signal_event(&ctx->event);
 		usbi_mutex_unlock(&ctx->event_data_lock);
 
 		/* take event handling lock */
@@ -1452,12 +1414,12 @@ void API_EXPORTED libusb_close(libusb_device_handle *dev_handle)
 
 	if (!handling_events) {
 		/* We're done with closing this device.
-		 * Clear the event pipe if there are no further pending events. */
+		 * Clear the event if there are no further pending events. */
 		usbi_mutex_lock(&ctx->event_data_lock);
 		ctx->device_close--;
 		pending_events = usbi_pending_events(ctx);
 		if (!pending_events)
-			usbi_clear_event(ctx);
+			usbi_clear_event(&ctx->event);
 		usbi_mutex_unlock(&ctx->event_data_lock);
 
 		/* Release event handling lock and wake up event waiters */

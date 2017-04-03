@@ -117,7 +117,7 @@ struct windows_usb_api_backend {
 	int (*submit_control_transfer)(int sub_api, struct usbi_transfer *itransfer);
 	int (*abort_control)(int sub_api, struct usbi_transfer *itransfer);
 	int (*abort_transfers)(int sub_api, struct usbi_transfer *itransfer);
-	int (*copy_transfer_data)(int sub_api, struct usbi_transfer *itransfer, uint32_t io_size);
+	int (*copy_transfer_data)(int sub_api, struct usbi_transfer *itransfer, DWORD io_size);
 };
 
 extern const struct windows_usb_api_backend usb_api_backend[USB_API_MAX];
@@ -271,13 +271,12 @@ static inline struct windows_device_handle_priv *_device_handle_priv(
 	return (struct windows_device_handle_priv *)handle->os_priv;
 }
 
-// used for async polling functions
 struct windows_transfer_priv {
-	struct winfd pollable_fd;
+	struct windows_overlapped ov;
 	uint8_t interface_number;
 	uint8_t *hid_buffer; // 1 byte extended data buffer, required for HID
 	uint8_t *hid_dest;   // transfer buffer destination, required for HID
-	size_t hid_expected_size;
+	DWORD hid_expected_size;
 };
 
 // used to match a device driver (including filter drivers) against a supported API

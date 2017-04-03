@@ -54,7 +54,7 @@
 #endif
 
 static int linux_netlink_socket = -1;
-static int netlink_control_pipe[2] = { -1, -1 };
+static usbi_event_t netlink_control_event = USBI_INVALID_EVENT;
 static pthread_t libusb_linux_event_thread;
 
 static void *linux_netlink_event_thread_main(void *arg);
@@ -131,25 +131,23 @@ int linux_netlink_start_event_monitor(void)
 		goto err_close_socket;
 	}
 
-	ret = usbi_pipe(netlink_control_pipe);
+	ret = usbi_create_event(&netlink_control_event);
 	if (ret) {
-		usbi_err(NULL, "failed to create netlink control pipe");
+		usbi_err(NULL, "failed to create netlink control event");
 		goto err_close_socket;
 	}
 
 	ret = pthread_create(&libusb_linux_event_thread, NULL, linux_netlink_event_thread_main, NULL);
 	if (ret != 0) {
 		usbi_err(NULL, "failed to create netlink event thread (%d)", ret);
-		goto err_close_pipe;
+		goto err_destroy_event;
 	}
 
 	return LIBUSB_SUCCESS;
 
-err_close_pipe:
-	close(netlink_control_pipe[0]);
-	close(netlink_control_pipe[1]);
-	netlink_control_pipe[0] = -1;
-	netlink_control_pipe[1] = -1;
+err_destroy_event:
+	usbi_destroy_event(&netlink_control_event);
+	netlink_control_event = (usbi_event_t)USBI_INVALID_EVENT;
 err_close_socket:
 	close(linux_netlink_socket);
 	linux_netlink_socket = -1;
@@ -159,27 +157,22 @@ err:
 
 int linux_netlink_stop_event_monitor(void)
 {
-	char dummy = 1;
-	ssize_t r;
+	int r;
 
 	assert(linux_netlink_socket != -1);
 
-	/* Write some dummy data to the control pipe and
-	 * wait for the thread to exit */
-	r = write(netlink_control_pipe[1], &dummy, sizeof(dummy));
-	if (r <= 0)
-		usbi_warn(NULL, "netlink control pipe signal failed");
-
+	/* signal the control event and wait for the thread to exit */
+	r = usbi_signal_event(&netlink_control_event);
+	if (r)
+		usbi_warn(NULL, "netlink control event signal failed");
 	pthread_join(libusb_linux_event_thread, NULL);
 
 	close(linux_netlink_socket);
 	linux_netlink_socket = -1;
 
-	/* close and reset control pipe */
-	close(netlink_control_pipe[0]);
-	close(netlink_control_pipe[1]);
-	netlink_control_pipe[0] = -1;
-	netlink_control_pipe[1] = -1;
+	/* close and reset control event */
+	usbi_destroy_event(&netlink_control_event);
+	netlink_control_event = (usbi_event_t)USBI_INVALID_EVENT;
 
 	return LIBUSB_SUCCESS;
 }
@@ -359,11 +352,9 @@ static int linux_netlink_read_message(void)
 
 static void *linux_netlink_event_thread_main(void *arg)
 {
-	char dummy;
 	int r;
-	ssize_t nb;
 	struct pollfd fds[] = {
-		{ .fd = netlink_control_pipe[0],
+		{ .fd = USBI_EVENT_GET_SOURCE(&netlink_control_event),
 		  .events = POLLIN },
 		{ .fd = linux_netlink_socket,
 		  .events = POLLIN },
@@ -379,10 +370,10 @@ static void *linux_netlink_event_thread_main(void *arg)
 			continue;
 		}
 		if (fds[0].revents & POLLIN) {
-			/* activity on control pipe, read the byte and exit */
-			nb = read(netlink_control_pipe[0], &dummy, sizeof(dummy));
-			if (nb <= 0)
-				usbi_warn(NULL, "netlink control pipe read failed");
+			/* activity on control event, clear it and exit */
+			r = usbi_clear_event(&netlink_control_event);
+			if (r)
+				usbi_warn(NULL, "netlink control event reset failed");
 			break;
 		}
 		if (fds[1].revents & POLLIN) {

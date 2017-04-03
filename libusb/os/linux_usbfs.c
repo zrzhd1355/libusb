@@ -38,6 +38,7 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "libusbi.h"
 #include "linux_usbfs.h"
@@ -1346,7 +1347,7 @@ static int op_open(struct libusb_device_handle *handle)
 			hpriv->caps |= USBFS_CAP_BULK_CONTINUATION;
 	}
 
-	r = usbi_add_pollfd(HANDLE_CTX(handle), hpriv->fd, POLLOUT);
+	r = usbi_add_event_source(HANDLE_CTX(handle), hpriv->fd, POLLOUT);
 	if (r < 0)
 		close(hpriv->fd);
 
@@ -1358,7 +1359,7 @@ static void op_close(struct libusb_device_handle *dev_handle)
 	struct linux_device_handle_priv *hpriv = _device_handle_priv(dev_handle);
 	/* fd may have already been removed by POLLERR condition in op_handle_events() */
 	if (!hpriv->fd_removed)
-		usbi_remove_pollfd(HANDLE_CTX(dev_handle), hpriv->fd);
+		usbi_remove_event_source(HANDLE_CTX(dev_handle), hpriv->fd);
 	close(hpriv->fd);
 }
 
@@ -2628,13 +2629,14 @@ static int reap_for_handle(struct libusb_device_handle *handle)
 }
 
 static int op_handle_events(struct libusb_context *ctx,
-	struct pollfd *fds, POLL_NFDS_TYPE nfds, int num_ready)
+	void *event_data, unsigned int cnt, int num_ready)
 {
+	struct pollfd *fds = (struct pollfd *)event_data;
 	int r;
 	unsigned int i = 0;
 
 	usbi_mutex_lock(&ctx->open_devs_lock);
-	for (i = 0; i < nfds && num_ready > 0; i++) {
+	for (i = 0; i < cnt && num_ready > 0; i++) {
 		struct pollfd *pollfd = &fds[i];
 		struct libusb_device_handle *handle;
 		struct linux_device_handle_priv *hpriv = NULL;
@@ -2659,7 +2661,7 @@ static int op_handle_events(struct libusb_context *ctx,
 			/* remove the fd from the pollfd set so that it doesn't continuously
 			 * trigger an event, and flag that it has been removed so op_close()
 			 * doesn't try to remove it a second time */
-			usbi_remove_pollfd(HANDLE_CTX(handle), hpriv->fd);
+			usbi_remove_event_source(HANDLE_CTX(handle), hpriv->fd);
 			hpriv->fd_removed = 1;
 
 			/* device will still be marked as attached if hotplug monitor thread
@@ -2707,14 +2709,6 @@ static int op_clock_gettime(int clk_id, struct timespec *tp)
   }
 }
 
-#ifdef USBI_TIMERFD_AVAILABLE
-static clockid_t op_get_timerfd_clockid(void)
-{
-	return monotonic_clkid;
-
-}
-#endif
-
 const struct usbi_os_backend linux_usbfs_backend = {
 	.name = "Linux usbfs",
 	.caps = USBI_CAP_HAS_HID_ACCESS|USBI_CAP_SUPPORTS_DETACH_KERNEL_DRIVER,
@@ -2757,10 +2751,6 @@ const struct usbi_os_backend linux_usbfs_backend = {
 	.handle_events = op_handle_events,
 
 	.clock_gettime = op_clock_gettime,
-
-#ifdef USBI_TIMERFD_AVAILABLE
-	.get_timerfd_clockid = op_get_timerfd_clockid,
-#endif
 
 	.device_priv_size = sizeof(struct linux_device_priv),
 	.device_handle_priv_size = sizeof(struct linux_device_handle_priv),

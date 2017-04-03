@@ -77,7 +77,7 @@ struct usbdk_device_priv {
 
 struct usbdk_transfer_priv {
 	USB_DK_TRANSFER_REQUEST request;
-	struct winfd pollable_fd;
+	struct windows_overlapped ov;
 	PULONG64 IsochronousPacketsArray;
 	PUSB_DK_ISO_TRANSFER_RESULT IsochronousResultsArray;
 };
@@ -552,17 +552,16 @@ static int usbdk_do_control_transfer(struct usbi_transfer *itransfer)
 	struct usbdk_device_priv *priv = _usbdk_device_priv(transfer->dev_handle->dev);
 	struct usbdk_transfer_priv *transfer_priv = _usbdk_transfer_priv(itransfer);
 	struct libusb_context *ctx = DEVICE_CTX(transfer->dev_handle->dev);
-	struct winfd wfd;
 	ULONG Length;
 	TransferResult transResult;
 	HANDLE sysHandle;
+	int r;
 
 	sysHandle = usbdk_helper.GetRedirectorSystemHandle(priv->redirector_handle);
 
-	wfd = usbi_create_fd(sysHandle, RW_READ, NULL, NULL);
-	// Always use the handle returned from usbi_create_fd (wfd.handle)
-	if (wfd.fd < 0)
-		return LIBUSB_ERROR_NO_MEM;
+	r = prepare_windows_overlapped(ctx, &transfer_priv->ov, sysHandle);
+	if (r)
+		return r;
 
 	transfer_priv->request.Buffer = (PVOID64)(uintptr_t)transfer->buffer;
 	transfer_priv->request.BufferLength = transfer->length;
@@ -571,26 +570,23 @@ static int usbdk_do_control_transfer(struct usbi_transfer *itransfer)
 	Length = (ULONG)transfer->length;
 
 	if (IS_XFERIN(transfer))
-		transResult = usbdk_helper.ReadPipe(priv->redirector_handle, &transfer_priv->request, wfd.overlapped);
+		transResult = usbdk_helper.ReadPipe(priv->redirector_handle, &transfer_priv->request, &transfer_priv->ov.overlapped);
 	else
-		transResult = usbdk_helper.WritePipe(priv->redirector_handle, &transfer_priv->request, wfd.overlapped);
+		transResult = usbdk_helper.WritePipe(priv->redirector_handle, &transfer_priv->request, &transfer_priv->ov.overlapped);
 
 	switch (transResult) {
 	case TransferSuccess:
-		wfd.overlapped->Internal = STATUS_COMPLETED_SYNCHRONOUSLY;
-		wfd.overlapped->InternalHigh = (DWORD)Length;
+		transfer_priv->ov.overlapped.Internal = STATUS_COMPLETED_SYNCHRONOUSLY;
+		transfer_priv->ov.overlapped.InternalHigh = (DWORD)Length;
+		SetEvent(transfer_priv->ov.overlapped.hEvent);
 		break;
 	case TransferSuccessAsync:
 		break;
 	case TransferFailure:
 		usbi_err(ctx, "ControlTransfer failed: %s", windows_error_str(0));
-		usbi_free_fd(&wfd);
+		clear_windows_overlapped(ctx, &transfer_priv->ov);
 		return LIBUSB_ERROR_IO;
 	}
-
-	// Use priv_transfer to store data needed for async polling
-	transfer_priv->pollable_fd = wfd;
-	usbi_add_pollfd(ctx, transfer_priv->pollable_fd.fd, POLLIN);
 
 	return LIBUSB_SUCCESS;
 }
@@ -601,9 +597,9 @@ static int usbdk_do_bulk_transfer(struct usbi_transfer *itransfer)
 	struct usbdk_device_priv *priv = _usbdk_device_priv(transfer->dev_handle->dev);
 	struct usbdk_transfer_priv *transfer_priv = _usbdk_transfer_priv(itransfer);
 	struct libusb_context *ctx = DEVICE_CTX(transfer->dev_handle->dev);
-	struct winfd wfd;
 	TransferResult transferRes;
 	HANDLE sysHandle;
+	int r;
 
 	transfer_priv->request.Buffer = (PVOID64)(uintptr_t)transfer->buffer;
 	transfer_priv->request.BufferLength = transfer->length;
@@ -621,34 +617,29 @@ static int usbdk_do_bulk_transfer(struct usbi_transfer *itransfer)
 		return LIBUSB_ERROR_INVALID_PARAM;
 	}
 
-	transfer_priv->pollable_fd = INVALID_WINFD;
-
 	sysHandle = usbdk_helper.GetRedirectorSystemHandle(priv->redirector_handle);
 
-	wfd = usbi_create_fd(sysHandle, IS_XFERIN(transfer) ? RW_READ : RW_WRITE, NULL, NULL);
-	// Always use the handle returned from usbi_create_fd (wfd.handle)
-	if (wfd.fd < 0)
-		return LIBUSB_ERROR_NO_MEM;
+	r = prepare_windows_overlapped(ctx, &transfer_priv->ov, sysHandle);
+	if (r)
+		return r;
 
 	if (IS_XFERIN(transfer))
-		transferRes = usbdk_helper.ReadPipe(priv->redirector_handle, &transfer_priv->request, wfd.overlapped);
+		transferRes = usbdk_helper.ReadPipe(priv->redirector_handle, &transfer_priv->request, &transfer_priv->ov.overlapped);
 	else
-		transferRes = usbdk_helper.WritePipe(priv->redirector_handle, &transfer_priv->request, wfd.overlapped);
+		transferRes = usbdk_helper.WritePipe(priv->redirector_handle, &transfer_priv->request, &transfer_priv->ov.overlapped);
 
 	switch (transferRes) {
 	case TransferSuccess:
-		wfd.overlapped->Internal = STATUS_COMPLETED_SYNCHRONOUSLY;
+		transfer_priv->ov.overlapped.Internal = STATUS_COMPLETED_SYNCHRONOUSLY;
+		SetEvent(transfer_priv->ov.overlapped.hEvent);
 		break;
 	case TransferSuccessAsync:
 		break;
 	case TransferFailure:
 		usbi_err(ctx, "ReadPipe/WritePipe failed: %s", windows_error_str(0));
-		usbi_free_fd(&wfd);
+		clear_windows_overlapped(ctx, &transfer_priv->ov);
 		return LIBUSB_ERROR_IO;
 	}
-
-	transfer_priv->pollable_fd = wfd;
-	usbi_add_pollfd(ctx, transfer_priv->pollable_fd.fd, IS_XFERIN(transfer) ? POLLIN : POLLOUT);
 
 	return LIBUSB_SUCCESS;
 }
@@ -659,9 +650,8 @@ static int usbdk_do_iso_transfer(struct usbi_transfer *itransfer)
 	struct usbdk_device_priv *priv = _usbdk_device_priv(transfer->dev_handle->dev);
 	struct usbdk_transfer_priv *transfer_priv = _usbdk_transfer_priv(itransfer);
 	struct libusb_context *ctx = DEVICE_CTX(transfer->dev_handle->dev);
-	struct winfd wfd;
 	TransferResult transferRes;
-	int i;
+	int i, r;
 	HANDLE sysHandle;
 
 	transfer_priv->request.Buffer = (PVOID64)(uintptr_t)transfer->buffer;
@@ -687,39 +677,34 @@ static int usbdk_do_iso_transfer(struct usbi_transfer *itransfer)
 	for (i = 0; i < transfer->num_iso_packets; i++)
 		transfer_priv->IsochronousPacketsArray[i] = transfer->iso_packet_desc[i].length;
 
-	transfer_priv->pollable_fd = INVALID_WINFD;
-
 	sysHandle = usbdk_helper.GetRedirectorSystemHandle(priv->redirector_handle);
 
-	wfd = usbi_create_fd(sysHandle, IS_XFERIN(transfer) ? RW_READ : RW_WRITE, NULL, NULL);
-	// Always use the handle returned from usbi_create_fd (wfd.handle)
-	if (wfd.fd < 0) {
+	r = prepare_windows_overlapped(ctx, &transfer_priv->ov, sysHandle);
+	if (r) {
 		free(transfer_priv->IsochronousPacketsArray);
 		free(transfer_priv->IsochronousResultsArray);
-		return LIBUSB_ERROR_NO_MEM;
+		return r;
 	}
 
 	if (IS_XFERIN(transfer))
-		transferRes = usbdk_helper.ReadPipe(priv->redirector_handle, &transfer_priv->request, wfd.overlapped);
+		transferRes = usbdk_helper.ReadPipe(priv->redirector_handle, &transfer_priv->request, &transfer_priv->ov.overlapped);
 	else
-		transferRes = usbdk_helper.WritePipe(priv->redirector_handle, &transfer_priv->request, wfd.overlapped);
+		transferRes = usbdk_helper.WritePipe(priv->redirector_handle, &transfer_priv->request, &transfer_priv->ov.overlapped);
 
 	switch (transferRes) {
 	case TransferSuccess:
-		wfd.overlapped->Internal = STATUS_COMPLETED_SYNCHRONOUSLY;
+		transfer_priv->ov.overlapped.Internal = STATUS_COMPLETED_SYNCHRONOUSLY;
+		SetEvent(transfer_priv->ov.overlapped.hEvent);
 		break;
 	case TransferSuccessAsync:
 		break;
 	case TransferFailure:
 		usbi_err(ctx, "ReadPipe/WritePipe failed: %s", windows_error_str(0));
-		usbi_free_fd(&wfd);
+		clear_windows_overlapped(ctx, &transfer_priv->ov);
 		free(transfer_priv->IsochronousPacketsArray);
 		free(transfer_priv->IsochronousResultsArray);
 		return LIBUSB_ERROR_IO;
 	}
-
-	transfer_priv->pollable_fd = wfd;
-	usbi_add_pollfd(ctx, transfer_priv->pollable_fd.fd, IS_XFERIN(transfer) ? POLLIN : POLLOUT);
 
 	return LIBUSB_SUCCESS;
 }
@@ -782,12 +767,6 @@ int windows_copy_transfer_data(struct usbi_transfer *itransfer, uint32_t io_size
 {
 	itransfer->transferred += io_size;
 	return LIBUSB_TRANSFER_COMPLETED;
-}
-
-struct winfd *windows_get_fd(struct usbi_transfer *transfer)
-{
-	struct usbdk_transfer_priv *transfer_priv = _usbdk_transfer_priv(transfer);
-	return &transfer_priv->pollable_fd;
 }
 
 static DWORD usbdk_translate_usbd_status(USBD_STATUS UsbdStatus)
@@ -894,9 +873,7 @@ const struct usbi_os_backend usbdk_backend = {
 	NULL,
 
 	usbdk_clock_gettime,
-#if defined(USBI_TIMERFD_AVAILABLE)
-	NULL,
-#endif
+
 	sizeof(struct usbdk_device_priv),
 	0,
 	sizeof(struct usbdk_transfer_priv),
